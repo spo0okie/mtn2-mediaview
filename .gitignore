@@ -1,0 +1,5 @@
+build-x64/
+dist/mtn.mediaview/*.dll
+dist/mtn.mediaview/*.lib
+dist/mtn.mediaview/*.exp
+*.zip

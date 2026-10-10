@@ -1,0 +1,15 @@
+{
+  "id": "mtn.mediaview",
+  "name": "Media viewer (libmpv)",
+  "version": "0.4.1",
+  "abi": 2,
+  "startup": true,
+  "permissions": ["vfs.read"],
+  "description": {
+    "en": "F3 on a picture or a video opens it in a viewer tab rendered by libmpv: zoom, pan, rotation, playback speed, paging through the folder. Needs MTN2 0.3.16 or newer.",
+    "ru": "F3 на картинке или видео открывает файл во вкладке просмотра на libmpv: масштаб, сдвиг, поворот, скорость воспроизведения, листание папки. Нужен MTN2 0.3.16 или новее."
+  },
+  "author": "spo0okie",
+  "homepage": "https://github.com/spo0okie/mtn2-mediaview",
+  "help": "help.md"
+}
