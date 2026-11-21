@@ -102,11 +102,13 @@ struct Player {
   HWND view = nullptr;
   mpv_handle *mpv = nullptr;
   HWND mpvChild = nullptr;
+  bool closing = false;     // Закрытие отложено до возврата из обработчика клавиши хоста.
 
   std::vector<FileEntry> files;
   int index = -1;
   std::wstring name;        // of the file on screen or being read
   bool waiting = false;     // the current file is still being read by the host
+  bool loading = false;     // mpv ещё распознаёт файл и готовит воспроизведение.
   bool hiddenPause = false; // paused by us because the tab went out of sight
 
   // observed
@@ -132,8 +134,6 @@ struct Player {
   POINT lastClickPt{};
 
   std::string lastStatus, lastTitle;
-  bool wantFull = false;    // full screen as the user left it (f, Enter, double click)
-  bool closing = false;     // WM_CLOSE_TAB is on its way
   std::string cursorUri;    // the file paged to: where the panel cursor goes on close
   std::map<std::string, bool> marks;   // Insert presses to carry into the panel on close, by URI
 
@@ -583,8 +583,7 @@ void WakeupCb(void *ctx)
   PostMessageW(static_cast<HWND>(ctx), WM_MPV_WAKEUP, 0, 0);
 }
 
-// The keyboard stays with the program: keys reach us through the surface key
-// callback. mpv's window must never keep the focus it may take on creation.
+// Передаёт фокус главному окну MTN2, чтобы клавиши шли через обработчик поверхности.
 void ReturnFocus(HWND from)
 {
   HWND root = GetAncestor(from, GA_ROOT);
@@ -595,14 +594,14 @@ void ReturnFocus(HWND from)
   if (attached) AttachThreadInput(me, tid, FALSE);
 }
 
-// Runs on mpv's VO thread: forward the mouse to the view window (same client
-// coordinates - the mpv window fills it), never block on the main thread.
+// В потоке вывода mpv пересылает события мыши контейнеру через его очередь.
+// Дочернее окно занимает весь контейнер, поэтому координаты совпадают.
 LRESULT CALLBACK MpvChildProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
   WNDPROC orig = reinterpret_cast<WNDPROC>(GetPropW(hWnd, kChildProp));
   HWND parent = GetParent(hWnd);
   switch (msg) {
-    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_MOUSEACTIVATE: return MA_ACTIVATE; // Активируем MTN2 и сохраняем первый клик.
     case WM_SETFOCUS:      ReturnFocus(hWnd); return 0;
     case WM_LBUTTONDOWN:   SetCapture(hWnd); break;
     case WM_LBUTTONUP:     ReleaseCapture(); break;
@@ -852,7 +851,7 @@ void UpdateInfo()
     _snprintf_s(b, _countof(b), _TRUNCATE, "%s[%d/%d]  ", cur ? "* " : "", g->index + 1, (int)g->files.size()); st += b;
     if (marked) { _snprintf_s(b, _countof(b), _TRUNCATE, "Selected %d  ", marked); st += b; }
   }
-  if (g->waiting) st += "Loading...  ";
+  if (g->waiting || g->loading) st += "Loading...  ";
   else if (g->vpDW > 0) {
     bool swap = ((g->vpRotate - g->userRotate) % 180) != 0;
     _snprintf_s(b, _countof(b), _TRUNCATE, "%lldx%lld  ", (long long)(swap ? g->vpDH : g->vpDW), (long long)(swap ? g->vpDW : g->vpDH));
@@ -888,6 +887,7 @@ void LoadCurrent()
     target = std::string(kStreamProtocol) + "://" + std::to_string(it->second.id) + "." + ExtOf(e.name);
   }
   g->waiting = false;
+  g->loading = true;
   g->loaded = false; g->eof = false; g->isImage = false;
   g->vpDW = g->vpDH = g->vpRotate = 0;
   g->timePos = g->duration = 0;
@@ -1096,21 +1096,8 @@ void ToggleFullscreen()
 {
   if (!g->surface || !g_host->surface_set_fullscreen) return;
   bool on = !IsFullscreen();
-  if (!on) g->wantFull = false;   // before the call: the resize it causes is not an Esc
   g_host->surface_set_fullscreen(g->surface, on ? 1 : 0);
-  g->wantFull = on;
   SetSetting("fullscreen", on ? "1" : "0");
-}
-
-// The host keeps Esc to itself, and in full screen its first Esc only leaves
-// full screen. For us Esc closes the viewer and the mode stays as it was: full
-// screen that ended without ToggleFullscreen was that Esc, so finish the job.
-void CheckEscFromFullscreen()
-{
-  if (!g->wantFull || g->closing || !g->surface || !g->view || !g_host->surface_get_fullscreen) return;
-  if (g_host->surface_get_fullscreen(g->surface) != 0) return;
-  g->closing = true;
-  PostMessageW(g->view, WM_CLOSE_TAB, 0, 0);   // not from inside the host's layout pass
 }
 
 void OnEof()
@@ -1165,6 +1152,7 @@ void DrainEvents()
         break;
       }
       case MPV_EVENT_FILE_LOADED:
+        g->loading = false;
         OnFileLoaded();
         break;
       case MPV_EVENT_VIDEO_RECONFIG:
@@ -1173,6 +1161,7 @@ void DrainEvents()
         ApplyView();
         break;
       case MPV_EVENT_END_FILE: {
+        g->loading = false;
         auto *e = static_cast<mpv_event_end_file *>(ev->data);
         if (e && e->reason == MPV_END_FILE_REASON_ERROR) {
           std::string m = "Cannot play " + WideToUtf8(g->name) + ": " + g_mpv.error_string(e->error);
@@ -1192,13 +1181,16 @@ void DrainEvents()
   UpdateInfo();
 }
 
+// Освобождает mpv до удаления родительского окна; повторный вход безопасен.
 void DestroyMpv()
 {
   if (!g->mpv) return;
   SetSetting("mute", g->muted ? "1" : "0");
-  g_mpv.set_wakeup_callback(g->mpv, nullptr, nullptr);
-  g_mpv.terminate_destroy(g->mpv);   // joins the VO thread, which destroys its window
+  mpv_handle *mpv = g->mpv;
+  // Ожидание рабочих потоков может доставить оконные сообщения повторно.
   g->mpv = nullptr;
+  g_mpv.set_wakeup_callback(mpv, nullptr, nullptr);
+  g_mpv.terminate_destroy(mpv);   // Дожидаемся потоков и закрытия файла до удаления Player.
   g->mpvChild = nullptr;
 }
 
@@ -1251,6 +1243,7 @@ void OnMouse(UINT msg, WPARAM wParam, LPARAM lParam)
 
 void CloseTabFromPlugin();
 
+// Обрабатывает сообщения окна просмотра в основном потоке MTN2.
 LRESULT CALLBACK ViewProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
   if (msg == WM_NCCREATE)
@@ -1259,7 +1252,13 @@ LRESULT CALLBACK ViewProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
   Player *player = reinterpret_cast<Player *>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
   if (!player) return DefWindowProcW(hWnd, msg, wParam, lParam);
   Use use(player);
+  // После Esc не обрабатываем события mpv и таймеры перед удалением окна.
+  if (g->closing && msg != WM_CLOSE_TAB && msg != WM_DESTROY && msg != WM_NCDESTROY)
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
   switch (msg) {
+    case WM_CLOSE_TAB:
+      CloseTabFromPlugin();   // Удаляет окно и Player; дальше к ним не обращаемся.
+      return 0;
     case WM_MPV_WAKEUP:
       DrainEvents();
       return 0;
@@ -1277,7 +1276,7 @@ LRESULT CALLBACK ViewProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
       return 0;
     }
     case WM_MOUSEACTIVATE:
-      return MA_NOACTIVATE;
+      return MA_ACTIVATE; // Активируем MTN2 и до появления окна вывода mpv.
     case WM_SETFOCUS:
       ReturnFocus(hWnd);
       return 0;
@@ -1285,10 +1284,6 @@ LRESULT CALLBACK ViewProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
       SubclassMpvChild();
       SizeChildToView();
       ApplyView();
-      CheckEscFromFullscreen();
-      return 0;
-    case WM_CLOSE_TAB:
-      CloseTabFromPlugin();   // destroys this window and the Player
       return 0;
     case WM_ERASEBKGND: {
       RECT rc; GetClientRect(hWnd, &rc);
@@ -1296,6 +1291,9 @@ LRESULT CALLBACK ViewProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
       return 1;
     }
     case WM_DESTROY:
+      // Останавливаем периодические вызовы до ожидания рабочих потоков mpv.
+      g->closing = true;
+      KillTimer(hWnd, 1);
       // The host destroys its container (and us with it) when the tab closes,
       // before the closed callback: mpv must go while its parent still exists.
       DestroyMpv();
@@ -1327,11 +1325,19 @@ std::string NormalizeKey(const char *key)
   return key;
 }
 
+// Обрабатывает клавиши просмотра; Esc/F10 закрывают вкладку без смены режима.
 int64_t OnKey(void *user, const char *rawKey)
 {
   Use use(static_cast<Player *>(user));
-  if (!g->mpv || !rawKey) return 0;
+  if (!rawKey) return 0;
   std::string k = NormalizeKey(rawKey);
+  if (k == "Esc" || k == "F10") {
+    // Хост ещё использует поверхность после возврата OnKey: не удаляем её здесь.
+    if (!g->closing && g->view && PostMessageW(g->view, WM_CLOSE_TAB, 0, 0)) g->closing = true;
+    return 1;
+  }
+  if (g->closing) return 1;
+  if (!g->mpv) return 0;
   bool video = g->loaded && !g->isImage;
   const double step = 60;   // pan step in pixels
 
@@ -1398,8 +1404,7 @@ int64_t OnKey(void *user, const char *rawKey)
 void OnTick(void *user)
 {
   Use use(static_cast<Player *>(user));
-  if (!g->surface) return;
-  CheckEscFromFullscreen();
+  if (!g->surface || g->closing) return;
   UpdateInfo();
 }
 
@@ -1451,6 +1456,8 @@ void CloseTabFromPlugin()
 {
   Player *player = g;
   int64_t surface = player->surface;
+  // Таймер хоста больше не нужен, в том числе во время уничтожения контейнера.
+  if (surface && g_host->surface_set_timer) g_host->surface_set_timer(surface, 0);
   player->surface = 0;
   if (surface) g_host->surface_close(surface);
   FinishClose(player);
@@ -1458,8 +1465,7 @@ void CloseTabFromPlugin()
 
 bool OpenSurface(const std::wstring &name)
 {
-  g->wantFull = GetSetting("fullscreen", "0") == "1";
-  int64_t mode = 256 + (g->wantFull ? 1 : 0);
+  int64_t mode = 256 + (GetSetting("fullscreen", "0") == "1" ? 1 : 0);
   std::string title = WideToUtf8(name);
   g->surface = g_host->surface_open_ex(kPluginId, title.c_str(), mode, OnKey, OnTick, OnClosed, nullptr, g);
   if (g->surface <= 0) { g->surface = 0; return false; }

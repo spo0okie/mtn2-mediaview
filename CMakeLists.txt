@@ -17,3 +17,15 @@ set_target_properties(mediaview PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${DIST}"
   RUNTIME_OUTPUT_DIRECTORY_RELEASE "${DIST}"
   RUNTIME_OUTPUT_DIRECTORY_DEBUG "${DIST}")
+
+# Регрессионная проверка времени жизни просмотра с имитацией API хоста.
+option(MEDIAVIEW_BUILD_TESTS "Build viewer lifecycle tests" OFF)
+if(MEDIAVIEW_BUILD_TESTS)
+  enable_testing()
+  add_executable(viewer_lifecycle_tests tests/viewer_lifecycle.cpp)
+  target_include_directories(viewer_lifecycle_tests PRIVATE include src)
+  target_compile_definitions(viewer_lifecycle_tests PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+  target_compile_options(viewer_lifecycle_tests PRIVATE /W4 /EHsc /utf-8)
+  target_link_libraries(viewer_lifecycle_tests PRIVATE user32 gdi32)
+  add_test(NAME viewer_lifecycle COMMAND viewer_lifecycle_tests)
+endif()
