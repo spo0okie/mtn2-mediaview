@@ -111,6 +111,10 @@ struct Player {
   bool loading = false;     // mpv ещё распознаёт файл и готовит воспроизведение.
   bool hiddenPause = false; // paused by us because the tab went out of sight
 
+  // PageDown ждёт первый кадр изображения. Повторы объединяются в один переход.
+  bool awaitingImage = false, pageDownPending = false;
+  int64_t imageEntry = 0, playingEntry = 0; // ID запрошенного изображения и файла из START_FILE.
+
   // observed
   double timePos = 0, duration = 0, speed = 1.0, volume = 100;
   bool paused = false, eof = false, muted = false, loaded = false;
@@ -549,12 +553,13 @@ int StreamOpen(void *user, char *uri, mpv_stream_cb_info *info)
 // ---------------------------------------------------------------------------
 // mpv plumbing
 
-void Command(const char *a, const char *b = nullptr, const char *c = nullptr, const char *d = nullptr,
-             const char *e = nullptr)
+// Выполняет команду mpv и возвращает код результата.
+int Command(const char *a, const char *b = nullptr, const char *c = nullptr, const char *d = nullptr,
+            const char *e = nullptr)
 {
-  if (!g->mpv) return;
+  if (!g->mpv) return MPV_ERROR_GENERIC;
   const char *args[6] = { a, b, c, d, e, nullptr };
-  g_mpv.command(g->mpv, args);
+  return g_mpv.command(g->mpv, args);
 }
 void SetStr(const char *n, const char *v) { if (g->mpv) g_mpv.set_property_string(g->mpv, n, v); }
 void SetDouble(const char *n, double v) { if (g->mpv) g_mpv.set_property(g->mpv, n, MPV_FORMAT_DOUBLE, &v); }
@@ -901,11 +906,18 @@ void LoadCurrent()
   std::string opts = std::string("video-unscaled=") + (g->noUpscale ? "downscale-big" : "no") +
                      ",loop-file=" + (InList(kLoopExts, ext) ? "inf" : "no");
   SetFlag("pause", false);
-  Command("loadfile", target.c_str(), "replace", "-1", opts.c_str());
+  if (Command("loadfile", target.c_str(), "replace", "-1", opts.c_str()) < 0) {
+    g->loading = g->awaitingImage = false;
+  } else if (g->awaitingImage) {
+    // replace создаёт единственную запись. События предыдущего файла ещё могут быть в очереди.
+    g->imageEntry = PropInt("playlist/0/id");
+    g->awaitingImage = g->imageEntry != 0;
+  }
   UpdateInfo();
 }
 
 void OnVfsOpen(void *user, int64_t status, int64_t handle);
+void ContinuePageDown();
 
 struct VfsRequest { std::string uri; int player; };
 
@@ -993,10 +1005,12 @@ void OnVfsOpen(void *user, int64_t status, int64_t handle)
     { std::lock_guard<std::mutex> lock(g->cacheLock); g->cache.erase(uri); }
     if (current && g->waiting) {
       g->waiting = false;
+      g->awaitingImage = false;
       if (status != 4 && g_host->show_message)   // 4 = cancelled, the user knows
         g_host->show_message(("Media viewer: " + WideToUtf8(g->name) + ": cannot read the file (status " +
                               std::to_string(status) + ")").c_str(), 1);
       UpdateInfo();
+      ContinuePageDown();
     }
     return;
   }
@@ -1009,6 +1023,7 @@ void OnVfsOpen(void *user, int64_t status, int64_t handle)
   }
   if (current && g->waiting) LoadCurrent();
   UpdateCache();
+  ContinuePageDown();
 }
 
 // Makes the file at index the current one: plays it at once when mpv can open
@@ -1019,6 +1034,9 @@ void Show(int index)
   const FileEntry &e = g->files[index];
   g->name = e.name;
   g->waiting = false;
+  g->pageDownPending = false;   // Явный переход к другому файлу отменяет отложенный PageDown.
+  g->imageEntry = 0;
+  g->awaitingImage = InList(kImageExts, ExtOf(e.name));
   bool ready = e.local();
   if (!ready) {
     std::lock_guard<std::mutex> lock(g->cacheLock);
@@ -1027,6 +1045,7 @@ void Show(int index)
   }
   if (ready) LoadCurrent();
   else if (Fetch(e.uri)) { g->waiting = true; UpdateInfo(); }
+  else g->awaitingImage = false;
   UpdateCache();
 }
 
@@ -1039,6 +1058,14 @@ bool GoTo(int index)
   // works with the panels on screen): the cursor is put there on close.
   g->cursorUri = g->files[index].uri;
   return true;
+}
+
+// Выполняет один отложенный переход после показа кадра или ошибки открытия.
+void ContinuePageDown()
+{
+  if (!g->pageDownPending || g->awaitingImage || g->closing) return;
+  g->pageDownPending = false;
+  GoTo(g->index + 1);
 }
 
 void Play()
@@ -1129,6 +1156,11 @@ void DrainEvents()
     mpv_event *ev = g_mpv.wait_event(g->mpv, 0);
     if (!ev || ev->event_id == MPV_EVENT_NONE) break;
     switch (ev->event_id) {
+      case MPV_EVENT_START_FILE: {
+        auto *e = static_cast<mpv_event_start_file *>(ev->data);
+        g->playingEntry = e ? e->playlist_entry_id : 0;
+        break;
+      }
       case MPV_EVENT_PROPERTY_CHANGE: {
         auto *p = static_cast<mpv_event_property *>(ev->data);
         if (!p->data) break;
@@ -1155,6 +1187,10 @@ void DrainEvents()
         g->loading = false;
         OnFileLoaded();
         break;
+      case MPV_EVENT_PLAYBACK_RESTART:
+        // При стандартных настройках mpv к этому событию первый кадр уже выведен.
+        if (g->imageEntry && g->playingEntry == g->imageEntry) g->awaitingImage = false;
+        break;
       case MPV_EVENT_VIDEO_RECONFIG:
         SubclassMpvChild();
         SizeChildToView();
@@ -1163,6 +1199,7 @@ void DrainEvents()
       case MPV_EVENT_END_FILE: {
         g->loading = false;
         auto *e = static_cast<mpv_event_end_file *>(ev->data);
+        if (e && e->playlist_entry_id == g->imageEntry) g->awaitingImage = false;
         if (e && e->reason == MPV_END_FILE_REASON_ERROR) {
           std::string m = "Cannot play " + WideToUtf8(g->name) + ": " + g_mpv.error_string(e->error);
           if (g_host && g_host->show_message) g_host->show_message(m.c_str(), 1);
@@ -1178,6 +1215,7 @@ void DrainEvents()
         break;
     }
   }
+  ContinuePageDown();
   UpdateInfo();
 }
 
@@ -1361,7 +1399,10 @@ int64_t OnKey(void *user, const char *rawKey)
     else PanBy(0, dir * step);
   }
   else if (k == "Space") { if (video) TogglePause(); else GoTo(g->index + 1); }
-  else if (k == "PageDown")  { GoTo(g->index + 1); }
+  else if (k == "PageDown") {
+    g->pageDownPending = true;
+    ContinuePageDown();
+  }
   else if (k == "Insert") {
     // As in the panels: mark / unmark the file and step to the next one. The
     // panel itself is updated when the tab closes (panel_select needs the

@@ -158,6 +158,81 @@ void TestMouseActivation()
   }
   if (root) DestroyWindow(root);
 }
+
+int64_t testEntry = 0;
+std::vector<mpv_event> testEvents;
+size_t nextEvent = 0;
+
+// Имитирует создание новой записи плейлиста для каждой команды loadfile.
+int TestLoadCommand(mpv_handle *, const char **args)
+{
+  if (strcmp(args[0], "loadfile") == 0) ++testEntry;
+  return 0;
+}
+
+// Возвращает ID запрошенного файла и признаки загруженного изображения.
+int TestImageProperty(mpv_handle *, const char *name, mpv_format format, void *data)
+{
+  if (strcmp(name, "playlist/0/id") == 0) {
+    *static_cast<int64_t *>(data) = testEntry;
+    return 0;
+  }
+  if (format == MPV_FORMAT_FLAG) {
+    *static_cast<int *>(data) = 1;
+    return 0;
+  }
+  return -1;
+}
+
+// Доставляет заданную тестом последовательность событий mpv.
+mpv_event *NextTestEvent(mpv_handle *, double)
+{
+  return nextEvent < testEvents.size() ? &testEvents[nextEvent++] : nullptr;
+}
+
+// Проверяет объединение повторов и привязку перехода к первому кадру нужного файла.
+void TestPageDown()
+{
+  g_mpv.command = TestLoadCommand;
+  g_mpv.get_property = TestImageProperty;
+  g_mpv.set_property = [](mpv_handle *, const char *, mpv_format, void *) { return 0; };
+  g_mpv.wait_event = NextTestEvent;
+  Player player;
+  player.mpv = reinterpret_cast<mpv_handle *>(1);
+  player.files = {
+    {"a", L"a.png", L"a.png"}, {"b", L"b.png", L"b.png"},
+    {"c", L"c.png", L"c.png"}, {"d", L"d.png", L"d.png"},
+  };
+  Use use(&player);
+  Show(0);
+  GoTo(1); // Первый файл заменён до обработки его событий.
+  for (int i = 0; i < 10; ++i) OnKey(&player, "PageDown");
+  Check(player.index == 1 && player.pageDownPending, "PageDown waits during image loading");
+
+  mpv_event_start_file previous{testEntry - 1}, current{testEntry};
+  mpv_event_end_file stopped{MPV_END_FILE_REASON_STOP, 0, previous.playlist_entry_id, 0, 0};
+  auto drain = [](std::initializer_list<mpv_event> events) {
+    testEvents.assign(events);
+    nextEvent = 0;
+    DrainEvents();
+  };
+  drain({{MPV_EVENT_START_FILE, 0, 0, &previous},
+         {MPV_EVENT_PLAYBACK_RESTART, 0, 0, nullptr},
+         {MPV_EVENT_END_FILE, 0, 0, &stopped},
+         {MPV_EVENT_START_FILE, 0, 0, &current},
+         {MPV_EVENT_FILE_LOADED, 0, 0, nullptr}});
+  Check(player.index == 1 && player.pageDownPending, "stale events and FILE_LOADED cannot release PageDown");
+
+  drain({{MPV_EVENT_PLAYBACK_RESTART, 0, 0, nullptr}});
+  Check(player.index == 2 && !player.pageDownPending, "first frame releases exactly one PageDown");
+
+  // Ошибка декодирования тоже освобождает переход, иначе листание застрянет.
+  OnKey(&player, "PageDown");
+  mpv_event_end_file failed{MPV_END_FILE_REASON_ERROR, -1, testEntry, 0, 0};
+  g_mpv.error_string = [](int) { return "invalid image"; };
+  drain({{MPV_EVENT_END_FILE, 0, 0, &failed}});
+  Check(player.index == 3 && !player.pageDownPending, "failed image releases pending PageDown");
+}
 } // namespace
 
 // Запускает сценарии отмены до окончания загрузки, включая повторный вход.
@@ -182,9 +257,10 @@ int main()
   TestKey("F10");
   TestHostClose();
   TestMouseActivation();
+  TestPageDown();
   UnregisterClassW(kViewClass, g_module);
   g_host = nullptr;
   if (failures) return 1;
-  std::puts("PASS: viewer lifecycle, VFS cleanup and mouse activation");
+  std::puts("PASS: viewer lifecycle, VFS cleanup, mouse activation and PageDown");
   return 0;
 }

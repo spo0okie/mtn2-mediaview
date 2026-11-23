@@ -58,6 +58,11 @@ typedef struct mpv_event_property {
   void       *data;
 } mpv_event_property;
 
+// Идентификатор записи плейлиста из события MPV_EVENT_START_FILE.
+typedef struct mpv_event_start_file {
+  int64_t playlist_entry_id;
+} mpv_event_start_file;
+
 typedef struct mpv_event_end_file {
   int     reason;
   int     error;
